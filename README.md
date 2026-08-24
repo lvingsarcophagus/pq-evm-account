@@ -4,7 +4,11 @@ Hybrid post-quantum signature verification for ERC-4337 smart accounts.
 Adds a quantum-safe backup signature requirement to any smart wallet today —
 no hard fork required.
 
-**Status: Phase 1b complete — experimental, unaudited.**
+**Status: Phase 2 complete — experimental, unaudited.**
+
+> **Requires `ffi = true`** (set in foundry.toml): the hybrid-signature tests
+> invoke the committed reference signer binary at `tools/signer-c13` (Linux
+> x86_64, MIT-licensed reference implementation from nconsigny/SPHINCs-).
 
 ## Results at a glance
 
@@ -59,6 +63,7 @@ forge test --match-contract DifferentialTest -vv      # impl agreement fuzzing
 
 - [x] Phase 1 — independent verifier validated against reference vectors
 - [x] Phase 1b — optimized hot path within ~5% of reference assembly
-- [ ] Phase 2 — ERC-4337 `HybridPQAccount` (`validateUserOp`: ECDSA + PQ)
+- [x] Phase 2 — ERC-4337 `HybridPQAccount` (`validateUserOp`: ECDSA + PQ),
+      executed end-to-end through the real v0.8 `EntryPoint.handleOps`
 - [ ] Phase 3 — multi-testnet gas consistency (Sepolia / Arbitrum / Base)
 - [ ] Phase 4 — writeup + community review
