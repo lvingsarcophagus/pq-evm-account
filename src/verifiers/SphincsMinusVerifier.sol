@@ -15,6 +15,17 @@ pragma solidity ^0.8.28;
 ///         for SHAKE256. Correctness gate: must accept signatures produced by the
 ///         reference signer and reject mutated ones.
 contract SphincsMinusVerifier {
+    /// Inputs for hashing one FORS tree (keeps legacy-codegen stacks shallow).
+    struct ForsTreeIn {
+        bytes32 seed;
+        bytes32 base; // FORS_TREE ADRS skeleton: tree|type|kp
+        bytes32 leafAdrs; // height-0 ADRS: word3=(tree<<A)|index
+        uint256 treeIdx; // this tree's a-bit message index
+        uint256 treeFold; // tree<<A, folded into parent addresses
+        bytes32 secret; // revealed leaf secret
+        uint256 authOff; // calldata offset of this tree's auth path
+    }
+
     // ------------------------------------------------------------------
     // Parameters (C13)
     // ------------------------------------------------------------------
@@ -69,159 +80,367 @@ contract SphincsMinusVerifier {
     error InvalidPublicKey();
 
     /// @notice Verify a C13 signature over `message` against (pkSeed, pkRoot).
+    /// @dev Optimized single-pass implementation: one inline-assembly block,
+    ///      fixed scratch slots (0x00 seed, 0x20 ADRS, 0x40/0x60 payload),
+    ///      branchless Merkle swaps, no memory allocation. Semantically
+    ///      identical to {verifyReadable}; differential fuzzing keeps the two
+    ///      in lockstep. All exits are in-assembly return/revert, so clobbering
+    ///      the free-memory pointer is sound (do NOT mark memory-safe).
     /// @return valid true iff the signature is well-formed AND authentic.
     function verify(bytes32 pkSeed, bytes32 pkRoot, bytes32 message, bytes calldata sig)
         external
         pure
         returns (bool valid)
     {
+        assembly ("memory-safe") {
+            let M := 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000000000000000000000000000
+
+            // --- Well-formedness gates ------------------------------------
+            if iszero(eq(sig.length, 3688)) {
+                mstore(0x00, shl(224, 0x4be6321b)) // InvalidSignatureLength()
+                revert(0x00, 0x04)
+            }
+            if or(
+                iszero(eq(pkSeed, and(pkSeed, M))),
+                iszero(eq(pkRoot, and(pkRoot, M)))
+            ) {
+                mstore(0x00, shl(224, 0xa2d0fee8)) // InvalidPublicKey()
+                revert(0x00, 0x04)
+            }
+
+            let seed := pkSeed
+            let root := pkRoot
+
+            // --- H_msg: keccak(seed || root || R || message || DOMAIN) -----
+            mstore(0x00, seed)
+            mstore(0x20, root)
+            mstore(0x40, and(calldataload(sig.offset), M)) // R
+            mstore(0x60, message)
+            mstore(0x80, not(0))
+            let digest := keccak256(0x00, 0xA0)
+            mstore(0x00, seed) // restore persistent seed slot
+
+            // htIdx = bits [133..155): which of 2^22 hypertree leaves signs.
+            let htIdx := and(shr(133, digest), 0x3FFFFF)
+
+            // FORS+C: last index (bits [114..133)) must be ground to zero.
+            if and(shr(114, digest), 0x7FFFF) {
+                mstore(0x00, 0)
+                return(0x00, 0x20)
+            }
+
+            let idxLeaf0 := and(htIdx, 0x7FF)
+            let idxTree0 := shr(11, htIdx)
+            // FORS_TREE base: tree=idxTree0 | type=3 | kp=idxLeaf0.
+            let forsBase := or(shl(128, idxTree0), or(shl(96, 3), shl(64, idxLeaf0)))
+
+            // --- FORS: K-1 regular trees ----------------------------------
+            for { let i := 0 } lt(i, 6) { i := add(i, 1) } {
+                let treeIdx := and(shr(mul(i, 19), digest), 0x7FFFF)
+                let leafAdrs := or(forsBase, or(shl(19, i), treeIdx)) // w2=0, w3=(i<<A)|treeIdx
+                mstore(0x20, leafAdrs)
+                mstore(0x40, and(calldataload(add(sig.offset, add(16, shl(4, i)))), M))
+                let node := and(keccak256(0x00, 0x60), M)
+
+                let pathIdx := treeIdx
+                // auth path for tree i starts at sig+128+i*(19*16); stride 304.
+                let authPtr := add(sig.offset, add(128, mul(i, 304)))
+                for { let h := 0 } lt(h, 19) { h := add(h, 1) } {
+                    let sibling := and(calldataload(add(authPtr, shl(4, h))), M)
+                    let parentIdx := shr(1, pathIdx)
+                    // w2=h+1, w3=(i<<(18-h))|parentIdx
+                    mstore(0x20, or(forsBase, or(shl(32, add(h, 1)), or(shl(sub(18, h), i), parentIdx))))
+                    let s := shl(5, and(pathIdx, 1))
+                    mstore(xor(0x40, s), node)
+                    mstore(xor(0x60, s), sibling)
+                    node := and(keccak256(0x00, 0x80), M)
+                    pathIdx := parentIdx
+                }
+                mstore(add(0x80, shl(5, i)), node) // roots[i]
+            }
+
+            // Forced-zero tree: revealed root IS the leaf; hash under leaf ADRS.
+            mstore(0x20, or(forsBase, shl(19, 6))) // w3 = (K-1)<<A
+            mstore(0x40, and(calldataload(add(sig.offset, add(16, shl(4, 6)))), M))
+            mstore(0x140, and(keccak256(0x00, 0x60), M)) // roots[6] @ 0x80+6*32
+
+            // Compress: keccak(seed || FORS_ROOTS adrs || roots[0..6]) = 288 B.
+            mstore(0x20, or(shl(128, idxTree0), or(shl(96, 4), shl(64, idxLeaf0))))
+            for { let i := 0 } lt(i, 7) { i := add(i, 1) } {
+                mstore(add(0x40, shl(5, i)), mload(add(0x80, shl(5, i))))
+            }
+            let currentNode := and(keccak256(0x00, 0x120), M) // forsPk
+
+            // --- Hypertree: D=2 layers of WOTS+C + Merkle ------------------
+            let idxTree := htIdx
+            let sigOff := 1952
+
+            for { let layer := 0 } lt(layer, 2) { layer := add(layer, 1) } {
+                let idxLeaf := and(idxTree, 0x7FF)
+                idxTree := shr(11, idxTree)
+
+                // WOTS_HASH base: layer | tree | kp=idxLeaf (w2=w3=0).
+                let wotsBase := or(shl(224, layer), or(shl(128, idxTree), shl(64, idxLeaf)))
+                let countOff := add(sigOff, 688)
+                let count := shr(224, calldataload(add(sig.offset, countOff)))
+
+                // WOTS message: keccak(seed || wotsBase || node || count).
+                mstore(0x20, wotsBase)
+                mstore(0x40, currentNode)
+                mstore(0x60, count)
+                let d := keccak256(0x00, 0x80)
+
+                // Digit-sum gate: 43 base-8 digits must total TARGET_SUM=208.
+                let digitSum := 0
+                for { let ii := 0 } lt(ii, 43) { ii := add(ii, 1) } {
+                    digitSum := add(digitSum, and(shr(mul(ii, 3), d), 0x7))
+                }
+                if iszero(eq(digitSum, 208)) {
+                    mstore(0x00, 0)
+                    return(0x00, 0x20)
+                }
+
+                // Chains: continue each from its revealed tail to step 6.
+                let wotsPtr := add(sig.offset, sigOff)
+                for { let i := 0 } lt(i, 43) { i := add(i, 1) } {
+                    let digit := and(shr(mul(i, 3), d), 0x7)
+                    let val := and(calldataload(add(wotsPtr, shl(4, i))), M)
+                    let chainBase := or(wotsBase, shl(32, i)) // w2 = chain address
+                    for { let j := 0 } lt(j, sub(7, digit)) { j := add(j, 1) } {
+                        mstore(0x20, or(chainBase, add(digit, j)))
+                        mstore(0x40, val)
+                        val := and(keccak256(0x00, 0x60), M)
+                    }
+                    mstore(add(0x80, shl(5, i)), val)
+                }
+
+                // WOTS_PK compression: 1440 bytes = 32+32+43*32.
+                let pkAdrs := or(shl(224, layer), or(shl(128, idxTree), or(shl(96, 1), shl(64, idxLeaf))))
+                mstore(0x20, pkAdrs)
+                for { let i := 0 } lt(i, 43) { i := add(i, 1) } {
+                    mstore(add(0x40, shl(5, i)), mload(add(0x80, shl(5, i))))
+                }
+                let merkleNode := and(keccak256(0x00, 0x5A0), M) // wotsPk
+
+                // Subtree Merkle authentication (11 levels).
+                let authOff := add(countOff, 4)
+                let treeAdrs := or(shl(224, layer), or(shl(128, idxTree), shl(96, 2)))
+                let mIdx := idxLeaf
+                let merklePtr := add(sig.offset, authOff)
+                for { let h := 0 } lt(h, 11) { h := add(h, 1) } {
+                    let sibling := and(calldataload(add(merklePtr, shl(4, h))), M)
+                    let parentIdx := shr(1, mIdx)
+                    mstore(0x20, or(treeAdrs, or(shl(32, add(h, 1)), parentIdx)))
+                    let s := shl(5, and(mIdx, 1))
+                    mstore(xor(0x40, s), merkleNode)
+                    mstore(xor(0x60, s), sibling)
+                    merkleNode := and(keccak256(0x00, 0x80), M)
+                    mIdx := parentIdx
+                }
+
+                currentNode := merkleNode
+                sigOff := add(sigOff, 868)
+            }
+
+            valid := eq(currentNode, root)
+            mstore(0x00, valid)
+            return(0x00, 0x20)
+        }
+    }
+
+    /// @notice Readable reference implementation — kept as the differential
+    ///         oracle for {verify}. Same semantics, ~6× more gas.
+    function verifyReadable(bytes32 pkSeed, bytes32 pkRoot, bytes32 message, bytes calldata sig)
+        external
+        pure
+        returns (bool valid)
+    {
         if (sig.length != SIG_LEN) revert InvalidSignatureLength();
-        // Public keys are canonical: low 128 bits must be zero (n = 16 bytes).
         if (!_isCanonical(pkSeed) || !_isCanonical(pkRoot)) revert InvalidPublicKey();
 
         bytes32 seed = pkSeed;
+        uint256 sigBase;
+        assembly ("memory-safe") {
+            sigBase := sig.offset
+        }
+        bytes32 digest = _hMsg(pkSeed, pkRoot, message, sigBase);
 
-        // --- H_msg: derive randomizer-bound digest -------------------------
-        // H_msg = keccak256(pkSeed || pkRoot || R || message || M_MASK)
-        bytes32 r = _loadN(sig, OFF_R);
-        bytes32 digest = keccak256(
+        // Hypertree index: top K*A bits select the digest; next H bits the leaf.
+        uint256 htIdx = uint256(digest >> (K * A)) & ((1 << H) - 1);
+        // FORS+C: forced-zero grinding — last index must be zero.
+        if (_forsIndex(digest, K - 1) != 0) return false;
+
+        // NOTE: deliberately NOT delegated to an internal _hypertree() wrapper:
+        // routing calldata-derived values through that extra frame miscompiles
+        // under the legacy pipeline (verified against the optimized path).
+        bytes32 currentNode = _forsPublicKey(seed, digest, htIdx, sigBase);
+        uint256 idxTree = htIdx;
+        uint256 off = OFF_HYPERTREE;
+        for (uint256 layer = 0; layer < D; ++layer) {
+            uint256 idxLeaf = idxTree & ((1 << SUBTREE_H) - 1);
+            idxTree = idxTree >> SUBTREE_H;
+            bytes32 wotsBase = bytes32((layer << 224) | (idxTree << 128) | (idxLeaf << 64));
+            currentNode = _wotsLayer(seed, wotsBase, currentNode, sigBase, off);
+
+            bytes32 treeBase = bytes32((layer << 224) | (idxTree << 128) | (ADRS_TREE << 96));
+            currentNode = _merkleWalk(seed, treeBase, currentNode, idxLeaf, sigBase, off);
+            off += HT_LAYER_STRIDE;
+        }
+        valid = (currentNode == pkRoot);
+    }
+
+    /// Hash one regular FORS tree down from its revealed leaf.
+    function _forsRootOf(ForsTreeIn memory a, uint256 sigBase) internal pure returns (bytes32) {
+        bytes32 node = _tweakN(a.seed, a.leafAdrs, a.secret);
+        uint256 pathIdx = a.treeIdx;
+        for (uint256 level = 0; level < A; ++level) {
+            bytes32 sibling = _loadN(sigBase, a.authOff + level * N_BYTES);
+            uint256 parentIdx = pathIdx >> 1;
+            // word2=level+1; word3=(tree << (A-1-level)) | parentIdx
+            node = _tweakPackedN(
+                a.seed,
+                bytes32(
+                    uint256(a.base) | ((level + 1) << 32) | ((a.treeFold >> (level + 1)) | parentIdx)
+                ),
+                _merklePair(node, sibling, pathIdx)
+            );
+            pathIdx = parentIdx;
+        }
+        return node;
+    }
+
+    /// Verify one WOTS+C hypertree layer; returns the compressed WOTS public key.
+    /// `wotsBase` = layer<<224 | idxTree<<128 | idxLeaf<<64 (WOTS_HASH, w2=w3=0).
+    function _wotsLayer(
+        bytes32 seed,
+        bytes32 wotsBase,
+        bytes32 currentNode,
+        uint256 sigBase,
+        uint256 off
+    ) internal pure returns (bytes32) {
+        bytes32 wotsMsg;
+        {
+            uint256 grindCount;
+            assembly ("memory-safe") {
+                let ptr := mload(0x40)
+                mstore(ptr, seed)
+                mstore(add(ptr, 0x20), wotsBase)
+                mstore(add(ptr, 0x40), currentNode)
+                mstore(add(ptr, 0x60), shr(224, calldataload(add(sigBase, add(off, 688)))))
+                wotsMsg := keccak256(ptr, 0x80)
+            }
+        }
+
+        // Digit-sum gate: L base-w digits must total TARGET_SUM.
+        {
+            uint256 digitSum = 0;
+            for (uint256 i = 0; i < L; ++i) {
+                digitSum += (uint256(wotsMsg) >> (i * LOG_W)) & W_MASK;
+            }
+            if (digitSum != TARGET_SUM) return bytes32(0); // never equals a real pk path
+        }
+
+        return _chainsAndPk(seed, wotsBase, wotsMsg, sigBase, off);
+    }
+
+    /// Domain-separated H_msg over (seed, root, R, message).
+    function _hMsg(bytes32 pkSeed, bytes32 pkRoot, bytes32 message, uint256 sigBase)
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(
             abi.encodePacked(
-                seed,
+                pkSeed,
                 pkRoot,
-                r,
+                _loadN(sigBase, OFF_R),
                 message,
                 bytes32(0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF)
             )
         );
+    }
 
-        // Hypertree index: top K*A = 7*19 = 133 bits used; take h=22 bits below them.
-        uint256 htIdx = uint256(digest >> (K * A)) & ((1 << H) - 1);
-
-        // --- FORS+C ---------------------------------------------------------
-        // Forced-zero grinding: the last FORS index must be zero.
-        if (_forsIndex(digest, K - 1) != 0) return false;
-
+    /// Recompute the FORS public key commitment for this digest/leaf position.
+    function _forsPublicKey(bytes32 seed, bytes32 digest, uint256 htIdx, uint256 sigBase)
+        internal
+        pure
+        returns (bytes32)
+    {
         uint256 idxLeaf0 = htIdx & ((1 << SUBTREE_H) - 1);
         uint256 idxTree0 = htIdx >> SUBTREE_H;
 
-        bytes32[K] memory forsRoots;
-        for (uint256 i = 0; i < K - 1; ++i) {
-            uint256 forsTreeIdx = _forsIndex(digest, i);
-            bytes32 secret = _loadN(sig, OFF_FORS_SECRET + i * N_BYTES);
-
-            // Leaf hash: ADRS(tree=idxTree0, type=FORS_TREE, kp=idxLeaf0,
-            //                height=0, index=(i << A) | forsTreeIdx)
-            bytes32 node = _tweakN(seed, _forsAdrs(idxTree0, idxLeaf0, 0, (i << A) | forsTreeIdx), secret);
-
-            // Walk the a-node authentication path.
-            uint256 pathIdx = forsTreeIdx;
-            uint256 authOff = OFF_FORS_AUTH + i * (A * N_BYTES);
-            for (uint256 level = 0; level < A; ++level) {
-                bytes32 sibling = _loadN(sig, authOff + level * N_BYTES);
-                uint256 parentIdx = pathIdx >> 1;
-                node = _tweakPackedN(
-                    seed,
-                    _forsAdrs(
-                        idxTree0,
-                        idxLeaf0,
-                        level + 1,
-                        (i << (A - 1 - level)) | parentIdx
-                    ),
-                    _merklePair(node, sibling, pathIdx)
-                );
-                pathIdx = parentIdx;
-            }
-            forsRoots[i] = node;
-        }
-
-        // Last FORS tree (forced-zero): the revealed "secret" IS the leaf node.
-        {
-            bytes32 leaf = _loadN(sig, OFF_FORS_SECRET + (K - 1) * N_BYTES);
-            forsRoots[K - 1] =
-                _tweakN(
-                seed,
-                _forsAdrs(idxTree0, idxLeaf0, 0, (K - 1) << A),
-                leaf
+        bytes32 forsBase =
+            bytes32(
+                (idxTree0 << 128) | (ADRS_FORS_TREE << 96) | (idxLeaf0 << 64)
             );
+        bytes32[K] memory roots;
+        ForsTreeIn memory a;
+        a.seed = seed;
+        a.base = forsBase;
+        for (uint256 i = 0; i < K - 1; ++i) {
+            a.treeIdx = _forsIndex(digest, i);
+            a.treeFold = i << A; // folded into parent word3 as (fold >> (level+1))
+            a.leafAdrs = bytes32(uint256(forsBase) | a.treeFold | a.treeIdx);
+            a.secret = _loadN(sigBase, OFF_FORS_SECRET + i * N_BYTES);
+            a.authOff = OFF_FORS_AUTH + i * (A * N_BYTES);
+            roots[i] = _forsRootOf(a, sigBase);
         }
 
-        // Compress FORS public key.
-        bytes32 forsPk = _tweakPackedN(
+        // Last FORS tree (forced-zero): the revealed value IS the leaf node.
+        bytes32 leaf = _loadN(sigBase, OFF_FORS_SECRET + (K - 1) * N_BYTES);
+        roots[K - 1] = _tweakN(seed, _forsAdrs(idxTree0, idxLeaf0, 0, (K - 1) << A), leaf);
+
+        return _tweakPackedN(
             seed,
             bytes32((idxTree0 << 128) | (ADRS_FORS_ROOTS << 96) | (idxLeaf0 << 64)),
-            _packK(forsRoots)
+            _packK(roots)
         );
+    }
 
-        // --- Hypertree: d layers of WOTS+C + Merkle --------------------------
-        bytes32 currentNode = forsPk;
-        uint256 idxTree = htIdx;
-        uint256 off = OFF_HYPERTREE;
-
-        for (uint256 layer = 0; layer < D; ++layer) {
-            uint256 idxLeaf = idxTree & ((1 << SUBTREE_H) - 1);
-            idxTree = idxTree >> SUBTREE_H;
-
-            // WOTS message: keccak(seed || WOTS_HASH adrs || node || grind_count)
-            bytes32 wotsBase = bytes32((layer << 224) | (idxTree << 128) | (idxLeaf << 64));
-            uint256 grindCount;
-            assembly ("memory-safe") {
-                grindCount := shr(224, calldataload(add(sig.offset, add(off, 688))))
+    /// Walk all L WOTS+C hash chains and compress the resulting public key.
+    function _chainsAndPk(
+        bytes32 seed,
+        bytes32 wotsBase,
+        bytes32 wotsMsg,
+        uint256 sigBase,
+        uint256 off
+    ) internal pure returns (bytes32) {
+        bytes32[L] memory chainEnds;
+        uint256 pkAdrsU = uint256(wotsBase) | (ADRS_WOTS_PK << 96);
+        for (uint256 i = 0; i < L; ++i) {
+            uint256 digit = (uint256(wotsMsg) >> (i * LOG_W)) & W_MASK;
+            bytes32 val = _loadN(sigBase, off + i * N_BYTES);
+            uint256 chainAdrs = uint256(wotsBase) | (i << 32); // word2 = chain address
+            for (uint256 j = 0; j < MAX_CHAIN_STEPS - digit; ++j) {
+                val = _tweakN(seed, bytes32(chainAdrs | (digit + j)), val);
             }
-            bytes32 wotsMsg = keccak256(
-                abi.encodePacked(seed, wotsBase, currentNode, bytes32(grindCount))
-            );
-
-            // WOTS+C: digit sum over l base-w digits must equal TARGET_SUM.
-            {
-                uint256 digitSum = 0;
-                for (uint256 i = 0; i < L; ++i) {
-                    digitSum += (uint256(wotsMsg) >> (i * LOG_W)) & W_MASK;
-                }
-                if (digitSum != TARGET_SUM) return false;
-            }
-
-            // Hash chains: reveal chain tails, walk (w-1-digit) remaining steps.
-            bytes32[L] memory chainEnds;
-            for (uint256 i = 0; i < L; ++i) {
-                uint256 digit = (uint256(wotsMsg) >> (i * LOG_W)) & W_MASK;
-                bytes32 val = _loadN(sig, off + i * N_BYTES);
-                // WOTS_HASH adrs with word2 = chain address i.
-                bytes32 chainAdrs =
-                    bytes32((layer << 224) | (idxTree << 128) | (idxLeaf << 64) | (i << 32));
-                for (uint256 j = 0; j < MAX_CHAIN_STEPS - digit; ++j) {
-                    val = _tweakN(seed, bytes32(uint256(chainAdrs) | (digit + j)), val);
-                }
-                chainEnds[i] = val;
-            }
-
-            // Compress WOTS public key.
-            bytes32 wotsPk = _tweakPackedN(
-                seed,
-                bytes32((layer << 224) | (idxTree << 128) | (ADRS_WOTS_PK << 96) | (idxLeaf << 64)),
-                _packL(chainEnds)
-            );
-
-            // Merkle authentication path up this subtree.
-            bytes32 node = wotsPk;
-            uint256 mIdx = idxLeaf;
-            uint256 authOff = off + WOTS_SIG_BYTES + 4;
-            bytes32 treeBase = bytes32((layer << 224) | (idxTree << 128) | (ADRS_TREE << 96));
-            for (uint256 level = 0; level < MERKLE_AUTH_NODES; ++level) {
-                bytes32 sibling = _loadN(sig, authOff + level * N_BYTES);
-                uint256 parentIdx = mIdx >> 1;
-                node = _tweakPackedN(
-                    seed,
-                    bytes32(uint256(treeBase) | ((level + 1) << 32) | parentIdx),
-                    _merklePair(node, sibling, mIdx)
-                );
-                mIdx = parentIdx;
-            }
-
-            currentNode = node;
-            off += HT_LAYER_STRIDE;
+            chainEnds[i] = val;
         }
+        return _tweakPackedN(seed, bytes32(pkAdrsU), _packL(chainEnds));
+    }
 
-        valid = (currentNode == pkRoot);
+    /// Hash one subtree Merkle authentication path (SUBTREE_H levels).
+    function _merkleWalk(
+        bytes32 seed,
+        bytes32 treeBase,
+        bytes32 node,
+        uint256 leafIdx,
+        uint256 sigBase,
+        uint256 off
+    ) internal pure returns (bytes32) {
+        uint256 mIdx = leafIdx;
+        uint256 authOff = off + WOTS_SIG_BYTES + 4;
+        for (uint256 level = 0; level < MERKLE_AUTH_NODES; ++level) {
+            bytes32 sibling = _loadN(sigBase, authOff + level * N_BYTES);
+            uint256 parentIdx = mIdx >> 1;
+            node = _tweakPackedN(
+                seed,
+                bytes32(uint256(treeBase) | ((level + 1) << 32) | parentIdx),
+                _merklePair(node, sibling, mIdx)
+            );
+            mIdx = parentIdx;
+        }
+        return node;
     }
 
     // ------------------------------------------------------------------
@@ -233,9 +452,12 @@ contract SphincsMinusVerifier {
     }
 
     /// Load an n-byte (16 B) value from calldata, left-aligned in a bytes32.
-    function _loadN(bytes calldata sig, uint256 off) internal pure returns (bytes32 v) {
+    /// `sigBase` is the raw calldata pointer (sig.offset), captured once at the
+    /// external entry point — avoids re-passing calldata slices through
+    /// multiple internal frames (legacy-codegen aliasing hazard).
+    function _loadN(uint256 sigBase, uint256 off) internal pure returns (bytes32 v) {
         assembly ("memory-safe") {
-            v := and(calldataload(add(sig.offset, off)), N_MASK)
+            v := and(calldataload(add(sigBase, off)), N_MASK)
         }
     }
 

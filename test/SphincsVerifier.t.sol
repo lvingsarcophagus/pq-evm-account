@@ -88,11 +88,17 @@ contract SphincsVerifierTest is Test {
     }
 
     /// Independent gas measurement against reference vectors.
+    /// Inputs are decoded from storage BEFORE the clock starts so we measure
+    /// pure verification cost, not SLOADs.
     function test_GasBenchmark() public {
         for (uint256 i = 0; i < vectors.length; ++i) {
             bytes32 msgHash = vm.parseBytes32(vectors[i].message);
+            bytes32 s = vectors[i].pkSeed;
+            bytes32 r = vectors[i].pkRoot;
+            bytes memory sig = vectors[i].sig;
+            assertTrue(verifier.verify(s, r, msgHash, sig));
             uint256 start = gasleft();
-            bool ok = verifier.verify(vectors[i].pkSeed, vectors[i].pkRoot, msgHash, vectors[i].sig);
+            bool ok = verifier.verify(s, r, msgHash, sig);
             uint256 used = start - gasleft();
             assertTrue(ok);
             emit log_named_uint(string.concat("verify(vector ", vm.toString(i), ") gas"), used);
