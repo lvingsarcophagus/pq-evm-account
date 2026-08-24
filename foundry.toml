@@ -9,7 +9,7 @@ via_ir = false
 ffi = true
 evm_version = "cancun"
 
-fs_permissions = [{ access = "read", path = "./test/vectors" }]
+fs_permissions = [{ access = "read", path = "./test/vectors" }, { access = "read", path = "./op.json" }]
 
 remappings = ["forge-std/=lib/forge-std/src/", "account-abstraction/=lib/account-abstraction/contracts/", "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/"]
 

@@ -52,6 +52,29 @@ benchmarks/      per-phase gas reports
 docs/            technical writeup (Phase 4)
 ```
 
+## Testnet / live bundler
+
+Deploy (any EVM chain with EntryPoint v0.8 at the canonical address):
+
+```shell
+export PRIVATE_KEY=<funded key>            # also becomes the ECDSA owner
+export ENTRYPOINT=0x4337084D9E255Ff0702461CF8895CE9E3b5FF108
+forge script script/DeployTestnet.s.sol --rpc-url <RPC> --broadcast
+```
+
+Send a hybrid-signed UserOp through a bundler:
+
+```shell
+export ACCOUNT=<deployed address>
+export BUNDLER_RPC=<alchemy/stackup/pimlico node URL>
+./scripts/send_userop.sh
+```
+
+The script computes `getUserOpHash`, PQ-signs it with the reference signer,
+rotates the on-chain PQ keys if needed, ECDSA-signs, and submits via
+`eth_sendUserOperation`. Verified end-to-end locally against a real
+`EntryPoint.handleOps` (nonce consumed, gas paid from the account deposit).
+
 ## Reproduce
 
 ```shell
