@@ -90,7 +90,7 @@ contract ThresholdHybridAccount is BaseAccount {
     function _validateSignature(
         PackedUserOperation calldata userOp,
         bytes32 userOpHash
-    ) internal view override returns (uint256 validationData) {
+    ) internal virtual override returns (uint256 validationData) {
         bytes calldata sig = userOp.signature;
         bool risky = _isRiskyCall(userOp.callData);
 

@@ -147,7 +147,34 @@ forge script script/BenchmarkChains.s.sol \
 Requires Foundry; `ffi = true` (already in foundry.toml); tests use the
 committed Linux x86_64 signer at `tools/signer-c13`.
 
-## 8. Future work
+## 8. Phase 5 — Naysayer/optimistic verification (opt-in)
+
+`src/account/OptimisticThresholdAccount.sol` extends the threshold model with
+an opt-in fast lane for risky operations:
+
+- **Validation:** risky ops authenticate with ECDSA alone when optimistic mode
+  is enabled — measured at **8,186 gas vs 118,699** for full hybrid validation
+  (14.5x reduction; PQ verification is skipped entirely).
+- **Challenge window:** such ops do not fire immediately. They are parked
+  (`PendingCreated`) and become executable only after `challengeWindow`
+  (minimum 10 minutes, default 1 hour) via `claimPending`.
+- **Naysayer step:** anyone can cancel a pending op during the window by
+  submitting its PQ signature to the full verifier and demonstrating it is
+  INVALID (`cancelPending`). Cancelling with a genuinely valid signature
+  reverts, so griefing against honest ops fails.
+
+**Trust-assumption tradeoff (never the default):** between ECDSA-only
+validation and execution there is a window in which a stolen-ECDSA-key
+attacker's large transfer sits pending. Fund safety during that window depends
+on at least one watcher running the free off-chain PQ check and paying
+cancellation gas for forgeries. This is strictly weaker than immediate hybrid
+verification and must be presented as such.
+
+Hybrid-validated operations (including administrative self-calls whose PQ
+signature was just verified) execute immediately — only fast-lane ops park.
+Mode toggling itself requires a hybrid self-call.
+
+## 9. Future work
 
 Live L2 receipts incl. L1-data fees; third-party bundler demonstration;
 session keys amortizing one hybrid signature across many cheap ops; Naysayer

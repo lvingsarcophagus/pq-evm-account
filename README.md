@@ -142,6 +142,17 @@ There is no way to weaken the policy with the ECDSA key alone.
 
 ---
 
+## Phase 5 (opt-in): Naysayer/optimistic mode
+
+`OptimisticThresholdAccount` adds an optional fast lane: risky operations
+validate with ECDSA only (**8K gas instead of 119K**) but sit behind a
+challenge window before executing. Anyone can cancel a pending operation by
+proving its PQ signature is invalid — honest users never pay verification
+gas; forgers get cancelled by any watcher.
+
+⚠️ Different security tradeoff, never the default: during the window your
+funds depend on someone watching. Enable via a hybrid-signed self-call.
+
 ## For developers: how it works
 
 ```text
