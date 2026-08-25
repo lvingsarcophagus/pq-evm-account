@@ -42,6 +42,16 @@ we reproduce it end-to-end. Full numbers and methodology:
 - Not audited. Research-stage; the planned hybrid ECDSA+PQ mode exists
   precisely because this code is unproven.
 
+## v2: risk-based protection for normal users
+
+`src/account/ThresholdHybridAccount.sol` makes PQ protection usable daily:
+ordinary transfers to **trusted targets** below a **value threshold**
+authenticate with ECDSA alone (normal cost/UX); risky operations — large
+transfers, untrusted callees, self-administration, policy changes — require
+the SPHINCS- signature on top. Fail-closed by default (unlisted = untrusted).
+The ECDSA owner can never weaken the policy directly once PQ keys are live:
+configuration is only reachable through hybrid-validated self-execution.
+
 ## Layout
 
 ```
