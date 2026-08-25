@@ -188,14 +188,21 @@ forge script script/BenchmarkChains.s.sol \
   --fork-url https://ethereum-sepolia-rpc.publicnode.com -vvv   # cross-chain
 ```
 
-## Credits & background
+## Credits, attribution & licensing
 
-- SPHINCS- proposal: nconsigny ([ethresear.ch, June 2026](https://ethresear.ch/t/sphincs-minus-efficient-stateless-post-quantum-signature-verification-on-the-evm/25165)),
-  built on SLH-DSA/FIPS 205, WOTS+C/FORS+C techniques (Drake et al.,
-  Kudinov & Nick), with upstream Lean/Verity proofs
-- ERC-4337: eth-infinitism (vendored at v0.8.0)
-- poqeth (2025) established hash-based verification viability on the EVM
+This project **builds on** published research — it is an independent
+implementation and extension, not a re-publication:
+
+- **SPHINCS- / C13 scheme**: nconsigny ([ethresear.ch, June 2026](https://ethresear.ch/t/sphincs-minus-efficient-stateless-post-quantum-signature-verification-on-the-evm/25165)) — we implement their *algorithm* in our own independent Solidity codebase and validate against their reference signer's outputs (committed binary, MIT).
+- **SLH-DSA / FIPS 205**: NIST · **WOTS+C / FORS+C compression**: Drake et al. (ePrint 2025/055), Kudinov & Nick (ePrint 2025/2203) · **poqeth** (2025) established hash-based PQ verification viability on the EVM.
+- **ERC-4337 contracts**: eth-infinitism v0.8.0 (vendored).
+
+Original contributions of this repo: the independent Solidity verifier,
+differential-testing methodology, the risk-gated `ThresholdHybridAccount`
+design, cross-chain benchmarks, and live deployments.
 
 ## License
 
-MIT
+MIT for original code — see [LICENSE](LICENSE) and
+[LICENSE-NOTICES.md](LICENSE-NOTICES.md). Note: vendored ERC-4337 contracts
+are GPL-3.0; deployed bytecode inheriting them carries those terms.
