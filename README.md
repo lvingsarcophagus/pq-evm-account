@@ -105,4 +105,5 @@ forge test --match-contract DifferentialTest -vv      # impl agreement fuzzing
       **98,118 gas identically** on Ethereum-Sepolia, Arbitrum-Sepolia,
       Base-Sepolia, OP-Sepolia, Polygon-Amoy (`benchmarks/gas-report.md`).
       Live deployments deferred.
-- [ ] Phase 4 — writeup + community review
+- [x] Phase 4 — technical writeup: [`docs/writeup.md`](docs/writeup.md)
+      (claims scoped to evidence; review invited, not claimed)
