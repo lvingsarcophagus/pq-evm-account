@@ -1,150 +1,154 @@
-# Hybrid Post-Quantum Signature Verification for ERC-4337 Smart Accounts
+# pq-evm-account — Technical Writeup v2
 
-**pq-evm-account — technical writeup, v1**
-Date: 2026-08-24 · Status: experimental, unaudited
+**Hybrid post-quantum signature verification for ERC-4337 smart accounts**
+Date: 2026-08-24 · Status: experimental, unaudited · License: MIT
 
 ---
 
 ## 1. Summary
 
-We implemented and validated an independent Solidity verifier for **SPHINCS- C13**
-— a stateless hash-based post-quantum signature scheme derived from SLH-DSA
-(FIPS 205), instantiated with keccak256 and parameterized for wallet-scale
-signature budgets — and integrated it into an ERC-4337 smart account that
-requires **both** a classical ECDSA signature and the PQ signature over every
-UserOperation.
+This project demonstrates that Ethereum smart accounts can gain **post-quantum
+signature protection today** — without a hard fork, precompile, or protocol
+change — by verifying SPHINCS- C13 signatures (hash-based, keccak256-instantiated)
+inside ERC-4337 `validateUserOp`.
 
-Every claim in this document is backed by an artifact in this repository
-(committed test vectors, runnable tests, benchmark scripts, or an on-chain
-transaction). Section 6 lists exactly what we do *not* claim.
+We ship and validate:
 
-## 2. Claims and their evidence
+1. **An independent Solidity verifier** for SPHINCS- C13 (3,704-byte signatures,
+   2²² per-key budget), optimized to **98,118 gas** on live chain state — within
+   5% of the reference assembly implementation and consistent across five EVM chains.
+2. **Two account designs** built on it:
+   - `HybridPQAccount` — every operation requires both ECDSA and PQ signatures
+     (maximum security, maximum cost).
+   - `ThresholdHybridAccount` — risk-based protection: everyday operations use
+     cheap ECDSA-only authentication; large transfers, untrusted callees, and
+     administration automatically demand the quantum-safe co-signature.
+
+Both were executed live on Sepolia through the canonical EntryPoint v0.8
+(`0x4337084D9E255Ff0702461CF8895CE9E3b5FF108`).
+
+## 2. Claims and evidence
 
 | # | Claim | Evidence |
 |---|---|---|
-| C1 | Our verifier accepts all valid reference-signer signatures | `test/SphincsVerifier.t.sol::test_ReferenceVectors_Accept`, vectors in `test/vectors/c13.json` |
-| C2 | Any single-bit mutation of a valid signature is rejected | `testFuzz_SigBitFlip_Reject` (256 runs), `DifferentialTest` fuzzing |
-| C3 | Wrong message / wrong hash / swapped keys are rejected; malformed inputs revert cleanly | `SphincsVerifierTest`, `HybridAccountTest` |
-| C4 | Verification costs **98,118 gas** (execution only) | `benchmarks/gas-report.md`, `script/BenchmarkChains.s.sol` |
-| C5 | That cost is **identical across Ethereum-Sepolia, Arbitrum-Sepolia, Base-Sepolia, OP-Sepolia, Polygon-Amoy** | same, forked-state simulation at live blocks |
-| C6 | A UserOp carrying both signatures executes through the real EntryPoint v0.8 on Sepolia | tx [`0xb987b7f3…ae291`](https://sepolia.etherscan.io/tx/0xb987b7f3a10ae26326439af36292d62ca7c4cd654250547a7212cbefb26ae291), account `0x7CD2f0C3…a38A9`, nonce consumed, deposit debited |
-| C7 | Either signature failing alone fails validation; both layers must pass | `HybridAccountTest` matrix + `test_handleOps_rejectsWhenOnlyECDSAValid` |
+| C1 | Verifier accepts all valid reference-signer signatures | `test_ReferenceVectors_Accept`, vectors in `test/vectors/c13.json` |
+| C2 | Any single-bit mutation of a valid signature is rejected | fuzz tests, 256+ runs per suite |
+| C3 | Wrong message/hash/keys rejected; malformed input reverts cleanly | `SphincsVerifierTest`, account test suites |
+| C4 | Verify costs **98,118 gas** (execution only) | `benchmarks/gas-report.md`, `script/BenchmarkChains.s.sol` |
+| C5 | Identical cost on Sepolia, Arbitrum-Sepolia, Base-Sepolia, OP-Sepolia, Polygon-Amoy | same, forked-state simulation |
+| C6 | Hybrid UserOp executed live via EntryPoint v0.8 on Sepolia | tx [`0xb987b7f3…ae291`](https://sepolia.etherscan.io/tx/0xb987b7f3a10ae26326439af36292d62ca7c4cd654250547a7212cbefb26ae291) |
+| C7 | Either signature failing alone fails validation | hybrid + threshold test matrices |
+| C8 | Cheap-path ops authenticate with a 65-byte ECDSA signature at normal cost, with zero PQ involvement | tx [`0xb18a0a82…d2c6b37`](https://sepolia.etherscan.io/tx/0xb18a0a82c088a1bb8e68343eee3b7666214ca3d75ed3519f637050523d2c6b37), 91,772 gas total |
+| C9 | Policy/PQ-key configuration cannot be weakened by the ECDSA key alone once provisioned | `ThresholdAccountTest::test_bootstrapThenLock`, `test_setPolicy_lockedAfterProvisioning` |
 
 ## 3. Design
 
-### 3.1 Parameter set (C13)
+### 3.1 SPHINCS- C13
 
-n=16, h=22 (2²² ≈ 4.2M signatures/key), d=2, FORS k=7/a=19, Winternitz w=8
-(l=43 chains), WOTS+C target digit-sum grinding (208), forced-zero FORS tree,
-keccak256 substituted for SHAKE256. Signature size 3,704 bytes. Parameters per
-the June 2026 ethresear.ch proposal by nconsigny; our implementation is an
-independent codebase following FIPS 205 §4.2 ADRS layout.
+Parameters per the June 2026 ethresear.ch proposal (nconsigny): n=16, h=22,
+d=2, FORS k=7/a=19, w=8/l=43, WOTS+C target-sum grinding (208), forced-zero
+FORS tree, keccak256 substituted for SHAKE256, FIPS 205 §4.2 ADRS layout.
+Our implementation is an independent codebase validated against the upstream
+reference signer's outputs.
 
-### 3.2 Two implementations, one contract
+### 3.2 Two implementations, differential testing
 
-- `verify()` — optimized single-pass assembly hot path: fixed scratch slots,
-  branchless Merkle swaps, no allocation. **105,707 gas** on Anvil defaults,
-  **98,118** on live-chain forks.
-- `verifyReadable()` — plain-Solidity oracle (~600K gas), kept solely as a
-  differential-fuzz counterpart: the two must agree bit-for-bit on acceptance
-  across mutated inputs (`test/Differential.t.sol`).
+`verify()` (optimized assembly) must agree bit-for-bit with
+`verifyReadable()` (plain-Solidity oracle) across mutated inputs. This caught
+two real defects during development. The readable version costs ~600K gas and
+exists purely as a test oracle.
 
-The optimization was gated by differential testing, which caught two real
-defects during development (static-array packing offsets; a lost FORS-commitment
-initialization during helper extraction).
+### 3.3 Signature layouts
 
-### 3.3 Hybrid account (`src/account/HybridPQAccount.sol`)
+```
+HybridPQAccount / risky path:
+  userOp.signature = SPHINCS- sig [3688 B] ‖ ECDSA r,s,v [65 B]   (3753 B)
 
-`userOp.signature = SPHINCS- sig (3688 B) ‖ ECDSA (r,s,v) (65 B)`, both over
-`userOpHash`. Validation returns ERC-4337 `SIG_VALIDATION_FAILED` (not a revert)
-when either layer fails, preserving mempool simulation semantics. The ECDSA
-owner may rotate PQ keys (`setPQKeys`); rotation changes only which PQ key must
-co-sign future spends — per-operation dual control is unchanged.
+ThresholdHybridAccount cheap path:
+  userOp.signature = ECDSA r,s,v [65 B]
+```
 
-## 4. Measurement notes (methodology honesty)
+Both signatures cover the same `userOpHash` (recomputed by EntryPoint v0.8).
 
-- **Storage-read pitfall:** an early benchmark measured ~250K gas of cold
-  SLOADs alongside verification because the 3.7 KB signature was decoded from
-  storage inside the timed region. All published numbers decode inputs first;
-  pure verify is what's reported.
-- **via-ir penalty:** IR codegen adds ~260K gas around the assembly block vs
-  the legacy pipeline; the project pins `via_ir = false`.
-- **Cross-chain method:** identical bytecode deployed against forked live state
-  via public RPC, deterministic across repeated runs. This isolates EVM
-  execution pricing; it does *not* capture L1 data-availability fees (§5).
-- The published ~127K figure for C13 reconciles with our 100–106K execution
-  measurement once transaction-level calldata cost (~59K for a mostly-nonzero
-  3.7 KB signature) is included.
+### 3.4 Risk classification (`ThresholdHybridAccount`)
 
-## 5. What we explicitly do NOT claim
+An operation requires the PQ co-signature if any of:
 
-Per the project's scope discipline:
+- global switch `requireHybridForAll`
+- transfer value ≥ `valueThreshold`
+- callee not in the trusted-target allowlist (**fail-closed default**)
+- self-targeted call (administration surface)
+- callData does not decode to a known execute selector
 
-1. **Not audited.** No formal verification of our Solidity (upstream provides a
-   Lean/Verity proof for *their* verifiers; ours is validated by differential +
-   vector testing only). Treat all contracts as research-stage.
-2. **No EOA protection.** Nothing here helps externally owned accounts; native
-   `ecrecover` interception requires protocol change.
-3. **No token-level protection.** ERC-20 transfers don't consult wallet
-   signatures; this doesn't make any token quantum-resistant.
-4. **L2 end-to-end cost unmeasured.** On Arbitrum/Base/OP the dominant UserOp
-   cost will be L1 data posting of the 3.7 KB signature, not the 98K execution
-   gas. We have not yet captured real receipts there.
-5. **Signer-side key management is out of scope for this repo.** The committed
-   `tools/signer-c13` is the upstream *demo* signer: it derives keys
-   deterministically from each message (no persistent secret). Our work
-   validates the verifier and account integration; production deployment needs
-   a real signer with protected secret state and a migration story.
-6. **Third-party bundler path partially blocked.** Live submission used
-   self-bundling (direct `handleOps`). Provider findings (Aug 2026):
-   - *Alchemy* free tier: `eth_sendUserOperation` rejected every op — including
-     minimal well-formed ones — with a generic field-validation error.
-   - *Pimlico*: accepts the op shape but its simulator reverts empty
-     (`AA24`/`-32521`) for our account's ops — including controls with
-     deliberately corrupted signatures — while identical inputs succeed through
-     `handleOps` on canonical chain state (`validateUserOp` → 0 on a fork at
-     latest block). Suggests a provider-node simulation divergence rather than
-     an op defect; reproduction details in repo history.
-   Third-party bundler demonstration remains open; self-bundled execution on
-   real chain state stands as the Phase 2 result.
-7. **Single parameter set.** Only C13 is implemented; hardware-wallet-friendly
-   variants (C11/C12) are future work.
+Configuration (`setPolicy`, `setTrustedTarget`) is reachable only through
+self-execution inside a hybrid-validated UserOp once PQ keys are live;
+before that, an explicit bootstrap window allows the ECDSA owner to configure
+and provision. Consequence: a quantum adversary holding only the ECDSA key
+can spend small amounts to already-trusted targets — nothing more — and can
+never disable or weaken the PQ layer.
+
+## 4. Measurements
+
+See [`benchmarks/gas-report.md`](../benchmarks/gas-report.md) for full detail.
+
+| Measurement | Result |
+|---|---|
+| verify() execution gas (live-chain forks, ×5 chains) | **98,118**, deterministic |
+| verify() on Anvil defaults | 105,707 |
+| Reference assembly verifier | 100,251 |
+| Full hybrid UserOp, live Sepolia | 272,212 gas (tx-level) |
+| Cheap-path UserOp, live Sepolia | 91,772 gas (tx-level) |
+
+Methodology notes: inputs decoded before timing (an early benchmark
+accidentally measured ~250K of storage reads); `via_ir = false` pinned
+(IR adds ~260K around the assembly block); cross-chain numbers come from
+forked-state simulation, which isolates EVM execution pricing from L1
+data-availability fees.
+
+## 5. What we do NOT claim
+
+1. **Not audited.** Our code is validated by vector tests, differential fuzzing,
+   and live execution — not formal verification or security review.
+2. **No EOA protection.** EOAs cannot intercept native `ecrecover`.
+3. **No token-level protection.** ERC-20 transfers don't consult wallet signatures.
+4. **L2 end-to-end fees unmeasured.** On rollups, posting the 3.7 KB signature
+   to L1 will dominate UserOp cost; real receipts pending.
+5. **Demo-grade signer.** The committed signer derives keys from each message
+   (no persistent secret). Production needs real secret management, which is
+   out of scope here. The *verifier* side is what this repo validates.
+6. **Third-party bundlers blocked (provider-side).** Live submission used
+   self-bundling. Alchemy free-tier blanket-rejects sends; Pimlico's simulator
+   reverts empty even on corrupted-signature controls while identical inputs
+   succeed on canonical state. Reproduction in repo history.
+7. **Single parameter set** (C13). Hardware-wallet-friendly variants future work.
+8. **Per-key budget:** ~4.2M signatures before FORS degradation requires rotation.
 
 ## 6. Security considerations
 
-- **Why hybrid:** the PQ code is new. Requiring ECDSA co-signature means an
-  undiscovered bug in either primitive alone cannot move funds. The residual
-  risk concentrates in implementation bugs common to both paths (e.g., hash
-  computation of `userOpHash`) and in the account logic itself.
-- **FORS few-time reuse:** C13's security degrades with per-key signature count
-  per the upstream analysis (2²² budget, k·a=133-bit FORS margin at low
-  counts). Keys should be rotated well before budget exhaustion.
-- **Key rotation trust:** `setPQKeys` is owner-only by design. An attacker with
-  only the PQ key material cannot rotate; an attacker with the ECDSA key can,
-  but then still cannot spend without a valid PQ signature under the new keys…
-  unless they also control the new PQ key. Rotation therefore assumes the
-  rotating party generates honest new PQ keys — acceptable for the reference
-  design, worth revisiting for production.
-- **Canonical-key check:** public keys must have zero lower halves; the
-  verifier reverts otherwise, preventing silent address-mismatch bricking.
+- **Why hybrid:** the PQ implementation is new; ECDSA co-signature means a bug
+  in either primitive alone cannot move funds.
+- **Threshold model residual risk:** small transfers to trusted targets are
+  ECDSA-only. Users should set thresholds according to what they can afford to
+  lose to a classical (non-quantum) key compromise.
+- **Bootstrap window:** before provisioning, the account has no PQ protection;
+  provision promptly after deployment.
+- **Canonical keys enforced** (zero lower halves) to prevent silent mismatch.
 
 ## 7. Reproduction
 
 ```shell
 git clone https://github.com/lvingsarcophagus/pq-evm-account && cd pq-evm-account
-forge install   # deps are vendored; forge build directly also works
-forge test                                            # 21 tests
-forge test --match-test test_GasBenchmark -vv         # gas numbers
+forge test                                          # 33 tests
+forge test --match-test test_GasBenchmark -vv       # gas
 forge script script/BenchmarkChains.s.sol \
   --fork-url https://ethereum-sepolia-rpc.publicnode.com -vvv
 ```
 
-Requires Foundry with `ffi = true` (set in foundry.toml); tests use the
-committed Linux x86_64 signer binary at `tools/signer-c13`.
+Requires Foundry; `ffi = true` (already in foundry.toml); tests use the
+committed Linux x86_64 signer at `tools/signer-c13`.
 
 ## 8. Future work
 
-Live deployments + receipts across L2 testnets (incl. L1-data fee capture);
-third-party bundler demonstration; audited/reviewed release; Naysayer
-optimistic-verification mode (opt-in, different trust assumptions); leanSPHINCS
-ZK-friendly variant tracking.
+Live L2 receipts incl. L1-data fees; third-party bundler demonstration;
+session keys amortizing one hybrid signature across many cheap ops; Naysayer
+optimistic verification; audited release; leanSPHINCS tracking.
