@@ -96,9 +96,17 @@ Per the project's scope discipline:
    validates the verifier and account integration; production deployment needs
    a real signer with protected secret state and a migration story.
 6. **Third-party bundler path partially blocked.** Live submission used
-   self-bundling (direct `handleOps`); Alchemy free-tier rejected
-   `eth_sendUserOperation` outright. Third-party bundler compatibility remains
-   to be demonstrated with Pimlico/Stackup or an Alchemy AA-enabled key.
+   self-bundling (direct `handleOps`). Provider findings (Aug 2026):
+   - *Alchemy* free tier: `eth_sendUserOperation` rejected every op — including
+     minimal well-formed ones — with a generic field-validation error.
+   - *Pimlico*: accepts the op shape but its simulator reverts empty
+     (`AA24`/`-32521`) for our account's ops — including controls with
+     deliberately corrupted signatures — while identical inputs succeed through
+     `handleOps` on canonical chain state (`validateUserOp` → 0 on a fork at
+     latest block). Suggests a provider-node simulation divergence rather than
+     an op defect; reproduction details in repo history.
+   Third-party bundler demonstration remains open; self-bundled execution on
+   real chain state stands as the Phase 2 result.
 7. **Single parameter set.** Only C13 is implemented; hardware-wallet-friendly
    variants (C11/C12) are future work.
 

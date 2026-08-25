@@ -60,10 +60,11 @@ A hybrid-signed UserOp **executed on Sepolia through the real v0.8 EntryPoint**:
   (status 1, 272,212 gas incl. the 98K SPHINCS- verification; nonce 0→1;
   gas paid from the account's EntryPoint deposit)
 
-Note: submitted via self-bundling (`handleOps` directly) because the Alchemy
-free-tier endpoint rejected all `eth_sendUserOperation` calls with a generic
-field-validation error — enable Alchemy's Account Kit product or use
-Pimlico/Stackup for third-party bundler submission.
+Note: submitted via self-bundling (`handleOps` directly). Both third-party
+bundlers tested rejected the op for provider-side reasons unrelated to validity
+(Alchemy free tier: blanket field-validation error; Pimlico: empty-revert
+simulation failures even for corrupted-signature controls) — see
+`docs/writeup.md` §5.6. The op itself provably validates on canonical state.
 
 ## Testnet / live bundler
 
