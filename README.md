@@ -52,6 +52,19 @@ benchmarks/      per-phase gas reports
 docs/            technical writeup (Phase 4)
 ```
 
+## Live result (Sepolia)
+
+A hybrid-signed UserOp **executed on Sepolia through the real v0.8 EntryPoint**:
+- Account: [`0x7CD2f0C30D5e0218e7Eaac535dd19108436a38A9`](https://sepolia.etherscan.io/address/0x7CD2f0C30D5e0218e7Eaac535dd19108436a38A9)
+- Bundle tx: [`0xb987b7f3...b26ae291`](https://sepolia.etherscan.io/tx/0xb987b7f3a10ae26326439af36292d62ca7c4cd654250547a7212cbefb26ae291)
+  (status 1, 272,212 gas incl. the 98K SPHINCS- verification; nonce 0→1;
+  gas paid from the account's EntryPoint deposit)
+
+Note: submitted via self-bundling (`handleOps` directly) because the Alchemy
+free-tier endpoint rejected all `eth_sendUserOperation` calls with a generic
+field-validation error — enable Alchemy's Account Kit product or use
+Pimlico/Stackup for third-party bundler submission.
+
 ## Testnet / live bundler
 
 Deploy (any EVM chain with EntryPoint v0.8 at the canonical address):

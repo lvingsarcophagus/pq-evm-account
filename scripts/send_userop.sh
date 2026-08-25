@@ -80,7 +80,7 @@ full_sig="${pq_sig#0x}${ecdsa_sig#0x}"
 echo "hybrid signature: $(( ${#full_sig} / 2 )) bytes"
 
 echo "== eth_sendUserOperation via bundler =="
-user_op_json="[{\"sender\":\"$ACCOUNT\",\"nonce\":\"$nonce\",\"initCode\":\"0x\",\"callData\":\"$call_data\",\"accountGasLimits\":\"$account_gas_limits\",\"preVerificationGas\":\"$(hex "$pre_verification_gas")\",\"gasFees\":\"$gas_fees\",\"paymasterAndData\":\"0x\",\"signature\":\"0x$full_sig\"}]"
+user_op_json="{\"sender\":\"$ACCOUNT\",\"nonce\":\"$nonce\",\"initCode\":\"0x\",\"callData\":\"$call_data\",\"accountGasLimits\":\"$account_gas_limits\",\"preVerificationGas\":\"$(hex "$pre_verification_gas")\",\"gasFees\":\"$gas_fees\",\"paymasterAndData\":\"0x\",\"signature\":\"0x$full_sig\"}"
 op_hash=$(cast rpc --rpc-url "$BUNDLER_RPC" eth_sendUserOperation "$user_op_json" "$ENTRYPOINT")
 echo "userOpHash (bundler): $op_hash"
 
