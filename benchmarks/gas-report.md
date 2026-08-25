@@ -52,3 +52,50 @@ forge test --match-contract DifferentialTest -vv      # impl-vs-impl agreement
 
 Vectors in `test/vectors/c13.json` were generated with the reference Rust
 signer (`signer-c13 c13 <msg-hex>`) and are committed for reproducibility.
+
+
+---
+
+# Phase 3 — Portability Validation
+
+Date: 2026-08-24
+Method: `script/BenchmarkChains.s.sol` forked against each chain's live state
+via public RPC (publicnode), deploying identical verifier bytecode and measuring
+`verify()` on committed vector 0. Two runs per chain for determinism.
+
+## Execution gas per chain
+
+| Chain | Chain ID | Block | verify() gas |
+|---|---|---|---|
+| Ethereum Sepolia | 11155111 | 11,561,547 | **98,118** |
+| Arbitrum Sepolia | 421614 | 11,561,548 | **98,118** |
+| Base Sepolia | 84532 | 45,930,912 | **98,118** |
+| OP Sepolia | 11155420 | 47,913,796 | **98,118** |
+| Polygon Amoy | 80022* | — | **98,118** |
+
+*Amoy chain id is 80002.
+
+Identical to the last digit across all five chains — EVM execution pricing for
+the opcodes SPHINCS- uses (KECCAK256, PUSH, MLOAD/MSTORE, flow control) does
+not vary between these L1/L2 environments. Local Anvil measured 105,707 due to
+dev-tooling gas-schedule differences, not chain differences.
+
+## The real cross-chain cost driver: data availability
+
+Execution gas is only part of the story. A C13 signature is 3,704 bytes of
+calldata:
+
+- **Ethereum / L1 rollups**: calldata costs ~16 gas/nonzero-byte at execution
+  layer, plus (on L2s) an L1 data-availability fee that scales with blob and
+  basefee markets. Expect the *dominant* UserOp cost on Arbitrum/Base/OP to be
+  L1 data posting of the signature, not the 98K execution gas.
+- **Validiums / alt-DA**: different tradeoff entirely; out of scope here.
+
+Phase 3 follow-up (deferred with live-bundler testing): measure actual
+end-to-end UserOp receipts per chain once funded keys are available.
+
+## Reproducing
+
+```shell
+forge script script/BenchmarkChains.s.sol --fork-url <RPC> -vvv
+```

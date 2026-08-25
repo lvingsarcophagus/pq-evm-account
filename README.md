@@ -88,5 +88,8 @@ forge test --match-contract DifferentialTest -vv      # impl agreement fuzzing
 - [x] Phase 1b — optimized hot path within ~5% of reference assembly
 - [x] Phase 2 — ERC-4337 `HybridPQAccount` (`validateUserOp`: ECDSA + PQ),
       executed end-to-end through the real v0.8 `EntryPoint.handleOps`
-- [ ] Phase 3 — multi-testnet gas consistency (Sepolia / Arbitrum / Base)
+- [x] Phase 3 — gas consistency verified via forked-state simulation:
+      **98,118 gas identically** on Ethereum-Sepolia, Arbitrum-Sepolia,
+      Base-Sepolia, OP-Sepolia, Polygon-Amoy (`benchmarks/gas-report.md`).
+      Live deployments deferred.
 - [ ] Phase 4 — writeup + community review
